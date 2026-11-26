@@ -39,6 +39,8 @@ const BRICK_SCORE: u32 = 10;
 const ENEMY_SCORE: u32 = 100;
 const LEVEL_SCORE: u32 = 500;
 const POWERUP_SCORE: u32 = 50;
+const TIME_BONUS_START: u32 = 300;
+const TIME_BONUS_MULTIPLIER: u32 = 5;
 
 const STARTING_LIVES: u32 = 3;
 
@@ -107,6 +109,7 @@ struct Bomb {
     y: usize,
     placed_at: Instant,
     range: usize,
+    detonated: bool,
 }
 
 struct Explosion {
@@ -157,6 +160,8 @@ struct Game {
     powerup_brick: Option<(usize, usize)>,
     powerup_kind: PowerupKind,
     score: u32,
+    time_bonus: u32,
+    last_timer_tick: Instant,
     level: u32,
     lives: u32,
     max_bombs: usize,
@@ -187,6 +192,8 @@ impl Game {
             powerup_brick: None,
             powerup_kind: PowerupKind::BombUp,
             score: 0,
+            time_bonus: TIME_BONUS_START,
+            last_timer_tick: Instant::now(),
             level: 1,
             lives: STARTING_LIVES,
             max_bombs: 1,
@@ -217,15 +224,41 @@ impl Game {
         0.10 + 0.80 * t
     }
 
+
+
+    // -----------------------------------------------------------------------
+    // Level generation & monster ratios
+    // -----------------------------------------------------------------------
+
+    fn level_progress(&self) -> f64 {
+        (self.level.saturating_sub(1).min(WIN_LEVEL - 1) as f64)
+            / ((WIN_LEVEL - 1).max(1) as f64)
+    }
+
+    fn filler_envelope_ratio(&self) -> f64 {
+        // Total filler (bricks + enemies) ramps from 5% (0.05) to 95% (0.95).
+        0.05 + 0.90 * self.level_progress()
+    }
+
+    fn enemy_filler_share(&self) -> f64 {
+        // Enemies' share of the filler budget ramps from 20% (0.20) down to 5% (0.05).
+        0.20 - 0.15 * self.level_progress()
+    }
+
+    fn brick_filler_share(&self) -> f64 {
+        // Bricks' share of the filler budget ramps from 80% (0.80) up to 95% (0.95).
+        1.0 - self.enemy_filler_share()
+    }
+
     fn monster_roster(&self, total: usize) -> Vec<EnemyKind> {
-        // Level 1..=25: ramps from 100% Critter / 0% Zombie -> 0% Critter / 100% Zombie.
-        // Level 26..=50: ramps from 100% Zombie / 0% Ghost  -> 0% Zombie / 100% Ghost.
+        // Level 1..=25:  Critter 100% -> 50%, Zombie 0% -> 50%, Ghost 0%
+        // Level 26..=50: Critter 50%  -> 10%, Zombie 50% -> 30%, Ghost 0% -> 60%
         let (critter_ratio, zombie_ratio, ghost_ratio) = if self.level <= 25 {
-            let p = ((self.level.saturating_sub(1)) as f64) / 24.0;
-            (1.0 - p, p, 0.0)
+            let p = (self.level.saturating_sub(1) as f64) / 24.0;
+            (1.0 - 0.50 * p, 0.50 * p, 0.0)
         } else {
-            let p = ((self.level - 26).min(24) as f64) / 24.0;
-            (0.0, 1.0 - p, p)
+            let p = ((self.level - 25).min(25) as f64) / 25.0;
+            (0.50 - 0.40 * p, 0.50 - 0.20 * p, 0.60 * p)
         };
 
         let mut roster = Vec::with_capacity(total);
@@ -245,10 +278,11 @@ impl Game {
     }
 
     fn generate_level(&mut self) {
+        use rand::seq::SliceRandom;
+
         let w = self.width;
         let h = self.height;
         let mut grid = vec![vec![Cell::Empty; w]; h];
-        let brick_prob = self.brick_fill_ratio();
 
         // solid border
         for x in 0..w {
@@ -260,8 +294,8 @@ impl Game {
             grid[y][w - 1] = Cell::Solid;
         }
 
-        // pillars + ramped brick fill across all interior cells (excluding border)
-        let mut brick_cells = Vec::new();
+        // pillars + collect candidate filler tiles (excluding border, pillars, and start pocket)
+        let mut filler_candidates = Vec::new();
         for y in 1..h - 1 {
             for x in 1..w - 1 {
                 if x % 2 == 0 && y % 2 == 0 {
@@ -271,29 +305,28 @@ impl Game {
                     || (x == 1 && y == 2 && h > 2)
                 {
                     grid[y][x] = Cell::Empty;
-                } else if rand::thread_rng().gen_bool(brick_prob) {
-                    grid[y][x] = Cell::Brick;
-                    brick_cells.push((x, y));
+                } else {
+                    filler_candidates.push((x, y));
                 }
             }
         }
 
-        // clear a starting pocket at (1,1)
-        if grid[1][1] == Cell::Brick {
-            brick_cells.retain(|&p| p != (1, 1));
-        }
-        grid[1][1] = Cell::Empty;
-        if w > 2 {
-            if grid[1][2] == Cell::Brick {
-                brick_cells.retain(|&p| p != (2, 1));
-            }
-            grid[1][2] = Cell::Empty;
-        }
-        if h > 2 {
-            if grid[2][1] == Cell::Brick {
-                brick_cells.retain(|&p| p != (1, 2));
-            }
-            grid[2][1] = Cell::Empty;
+        let mut rng = rand::thread_rng();
+        filler_candidates.shuffle(&mut rng);
+
+        let total_filler = ((filler_candidates.len() as f64) * self.filler_envelope_ratio())
+            .round()
+            .clamp(1.0, filler_candidates.len() as f64) as usize;
+
+        let num_enemies = ((total_filler as f64) * self.enemy_filler_share())
+            .round()
+            .clamp(1.0, total_filler as f64) as usize;
+        let num_bricks = total_filler.saturating_sub(num_enemies);
+
+        let mut brick_cells = Vec::with_capacity(num_bricks);
+        for &(x, y) in filler_candidates.iter().take(num_bricks) {
+            grid[y][x] = Cell::Brick;
+            brick_cells.push((x, y));
         }
 
         // hide the door under a brick, far from start if possible
@@ -303,9 +336,9 @@ impl Game {
             .filter(|&(x, y)| (x + y) > 6)
             .collect();
         let door_pos = if !far_candidates.is_empty() {
-            far_candidates[rand::thread_rng().gen_range(0..far_candidates.len())]
+            far_candidates[rng.gen_range(0..far_candidates.len())]
         } else if !brick_cells.is_empty() {
-            brick_cells[rand::thread_rng().gen_range(0..brick_cells.len())]
+            brick_cells[rng.gen_range(0..brick_cells.len())]
         } else {
             (w - 3, h - 3)
         };
@@ -321,7 +354,7 @@ impl Game {
             .filter(|&p| p != door_pos)
             .collect();
         let powerup_brick = if !powerup_candidates.is_empty() {
-            Some(powerup_candidates[rand::thread_rng().gen_range(0..powerup_candidates.len())])
+            Some(powerup_candidates[rng.gen_range(0..powerup_candidates.len())])
         } else {
             None
         };
@@ -336,33 +369,32 @@ impl Game {
             PowerupKind::Detonator,
             PowerupKind::LifeUp,
         ];
-        let powerup_kind = kinds[rand::thread_rng().gen_range(0..kinds.len())];
+        let powerup_kind = kinds[rng.gen_range(0..kinds.len())];
 
-        // spawn enemies on empty tiles far from start
+        // spawn enemies on empty tiles (preferring manhattan distance >= 5 from (1, 1))
         let now = Instant::now();
-        let target = 2 + self.level as usize;
-        let roster = self.monster_roster(target);
-        let mut enemies = Vec::new();
-        let mut attempts = 0;
-        while enemies.len() < target && attempts < 500 {
-            attempts += 1;
-            let x = rand::thread_rng().gen_range(1..w - 1);
-            let y = rand::thread_rng().gen_range(1..h - 1);
-            if grid[y][x] != Cell::Empty {
-                continue;
+        let roster = self.monster_roster(num_enemies);
+        let mut far_empty: Vec<(usize, usize)> = Vec::new();
+        let mut fallback_empty: Vec<(usize, usize)> = Vec::new();
+        for y in 1..h - 1 {
+            for x in 1..w - 1 {
+                if grid[y][x] == Cell::Empty && !(x == 1 && y == 1) {
+                    let manhattan = (x as isize - 1).abs() + (y as isize - 1).abs();
+                    if manhattan >= 5 {
+                        far_empty.push((x, y));
+                    } else {
+                        fallback_empty.push((x, y));
+                    }
+                }
             }
-            if x == 1 && y == 1 {
-                continue;
-            }
-            let manhattan = (x as isize - 1).abs() + (y as isize - 1).abs();
-            if manhattan < 5 {
-                continue;
-            }
-            if enemies.iter().any(|e: &Enemy| e.x == x && e.y == y) {
-                continue;
-            }
-            let kind = roster[enemies.len()];
-            enemies.push(Enemy::new(kind, x, y, now));
+        }
+        far_empty.shuffle(&mut rng);
+        fallback_empty.shuffle(&mut rng);
+        far_empty.extend(fallback_empty);
+
+        let mut enemies = Vec::with_capacity(num_enemies.min(far_empty.len()));
+        for (i, &(x, y)) in far_empty.iter().take(num_enemies).enumerate() {
+            enemies.push(Enemy::new(roster[i], x, y, now));
         }
 
         self.grid = grid;
@@ -373,10 +405,12 @@ impl Game {
         self.door_pos = door_pos;
         self.powerup_brick = powerup_brick;
         self.powerup_kind = powerup_kind;
+        self.time_bonus = TIME_BONUS_START;
+        self.last_timer_tick = now;
     }
 
     fn next_level(&mut self) {
-        self.score += LEVEL_SCORE;
+        self.score += LEVEL_SCORE + self.time_bonus * TIME_BONUS_MULTIPLIER;
         self.sounds.push(Sound::LevelUp);
         if self.level >= WIN_LEVEL {
             self.won = true;
@@ -475,6 +509,7 @@ impl Game {
             y: self.player.1,
             placed_at: Instant::now(),
             range: self.bomb_range,
+            detonated: false,
         });
         self.sounds.push(Sound::Bomb);
     }
@@ -494,7 +529,9 @@ impl Game {
         let now = Instant::now();
         for b in &mut self.bombs {
             b.placed_at = now - Duration::from_millis(self.bomb_fuse_ms + 1);
+            b.detonated = true;
         }
+        self.sounds.push(Sound::Explosion);
         true
     }
 
@@ -522,6 +559,7 @@ impl Game {
                 if let Some(respawn_at) = self.pending_respawn_at.as_mut() {
                     *respawn_at += paused_dur;
                 }
+                self.last_timer_tick += paused_dur;
             }
             self.paused = false;
         }
@@ -541,6 +579,13 @@ impl Game {
         }
         let now = Instant::now();
 
+        // 0) decrement time bonus counter once per second (floored at 0)
+        let elapsed_secs = now.duration_since(self.last_timer_tick).as_secs();
+        if elapsed_secs > 0 {
+            self.time_bonus = self.time_bonus.saturating_sub(elapsed_secs as u32);
+            self.last_timer_tick += Duration::from_secs(elapsed_secs);
+        }
+
         // 1) explode any bombs whose fuse has run out
         let mut bombs_to_explode = Vec::new();
         for (i, bomb) in self.bombs.iter().enumerate() {
@@ -549,8 +594,12 @@ impl Game {
             }
         }
 
+        let mut play_explosion_sfx = false;
         for i in bombs_to_explode.clone().into_iter().rev() {
             let bomb = self.bombs.remove(i);
+            if !bomb.detonated {
+                play_explosion_sfx = true;
+            }
             let mut new_explosions = Vec::new();
             self.create_explosion(bomb.x, bomb.y, bomb.range, &mut new_explosions);
 
@@ -562,7 +611,7 @@ impl Game {
 
             self.explosions.extend(new_explosions);
         }
-        if !bombs_to_explode.is_empty() {
+        if play_explosion_sfx {
             self.sounds.push(Sound::Explosion);
         }
 
@@ -848,21 +897,18 @@ impl Game {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(self.height as u16),
-                Constraint::Min(0),
-            ])
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(area);
 
         let alive_enemies = self.enemies.iter().filter(|e| e.alive).count();
         let bombs_ready = self.max_bombs.saturating_sub(self.bombs.len());
         let detonator = if self.has_detonator { "  |  🧨" } else { "" };
         let status = format!(
-            " Level {}/{}  |  Score {}  |  💖 {}  |  💣 {}/{} (r{})  |  👾 {}{}",
+            " Level {}/{}  |  Score {}  |  ⏱ {}  |  💖 {}  |  💣 {}/{} (r{})  |  👾 {}{}",
             self.level,
             WIN_LEVEL,
             self.score,
+            self.time_bonus,
             self.lives,
             bombs_ready,
             self.max_bombs,
@@ -933,9 +979,20 @@ impl Game {
             lines.push(line);
         }
 
+        let board_w = (self.width as u16).saturating_mul(2).min(chunks[1].width);
+        let board_h = (self.height as u16).min(chunks[1].height);
+        let board_x = chunks[1].x + chunks[1].width.saturating_sub(board_w) / 2;
+        let board_y = chunks[1].y + chunks[1].height.saturating_sub(board_h) / 2;
+        let board_rect = Rect {
+            x: board_x,
+            y: board_y,
+            width: board_w,
+            height: board_h,
+        };
+
         let field =
             Paragraph::new(Text::from(lines.join("\n"))).style(Style::default().fg(Color::White));
-        frame.render_widget(field, chunks[1]);
+        frame.render_widget(field, board_rect);
 
         if self.won {
             let banner = Paragraph::new("🏆 You win! 🏆 — R to restart, Q to quit")

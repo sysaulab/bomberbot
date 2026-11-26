@@ -34,7 +34,7 @@ A Rust terminal (TUI) Bomberman game using `ratatui` + `crossterm`, single binar
 ## Notes
 
 - Powerups: each level hides one powerup under a brick distinct from the door. Kinds: `BombUp` (+max bombs), `FireUp` (+blast range), `SpeedUp` (shorter fuse). Collected on walk-over.
-- Lives: start `STARTING_LIVES` (3); level completion grants +1 life; death decrements and respawns at (1,1) until 0 → game over.
+- Lives: start `STARTING_LIVES` (3); level completion grants +1 life; death decrements and respawns at (1,1) until 0 -> game over.
 - Audio: WAV files generated at runtime into a temp dir and played via `afplay` (macOS) / `aplay` (Linux); `Audio::new()` returns `None` if no player exists and the game runs silently. SFX and a looping generated chiptune melody.
 - `max_bombs` starts at 1 and grows via BombUp; blast range starts 2 and grows via FireUp; fuse starts `BOMB_FUSE_MS` and shrinks via SpeedUp (min 800ms).
 - The door is represented as a `Brick` until blasted; `door_pos` is tracked separately.
